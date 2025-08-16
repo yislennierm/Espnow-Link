@@ -3,7 +3,7 @@
 #include <esp_wifi.h>
 #include <esp_now.h>
 
-// ===== Compile-time config =====
+// = Compile-time config =====
 #ifndef ESPNOW_CHANNEL
 #define ESPNOW_CHANNEL 6
 #endif
