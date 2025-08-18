@@ -48,28 +48,24 @@
 #endif
 
 // ----------------- Protocol selection -----------------
-// Define ONE of: PROTO_GHST, PROTO_CRSF, PROTO_SBUS
 #if !defined(PROTO_GHST) && !defined(PROTO_CRSF) && !defined(PROTO_SBUS)
 #warning "No PROTO_* defined; defaulting to GHST"
 #define PROTO_GHST
 #endif
 
-#if defined(PROTO_GHST)
-// Ghost: 420k 8N1, non-inverted
+#if defined(PROTO_GHST)      // Ghost: 420k 8N1, non-inverted
 static constexpr uint32_t PROTO_BAUD = 420000;
 static constexpr uint32_t PROTO_CFG  = SERIAL_8N1;
 static constexpr bool RX_INVERT = false;
 static constexpr bool TX_INVERT = false;
 static constexpr uint8_t PROTO_ID = 3;
-#elif defined(PROTO_CRSF)
-// CRSF: 420k 8N1, non-inverted
+#elif defined(PROTO_CRSF)    // CRSF: 420k 8N1, non-inverted
 static constexpr uint32_t PROTO_BAUD = 420000;
 static constexpr uint32_t PROTO_CFG  = SERIAL_8N1;
 static constexpr bool RX_INVERT = false;
 static constexpr bool TX_INVERT = false;
 static constexpr uint8_t PROTO_ID = 1;
-#elif defined(PROTO_SBUS)
-// SBUS: 100k 8E2, inverted
+#elif defined(PROTO_SBUS)    // SBUS: 100k 8E2, inverted
 static constexpr uint32_t PROTO_BAUD = 100000;
 static constexpr uint32_t PROTO_CFG  = SERIAL_8E2;
 static constexpr bool RX_INVERT = true;
@@ -107,7 +103,6 @@ struct RadioHdr {
 };
 #pragma pack(pop)
 
-// Keep ESP-NOW payloads modest
 static_assert(MAX_PAYLOAD <= 200, "Keep MAX_PAYLOAD <= 200");
 
 // ----------------- Globals -----------------
@@ -126,6 +121,10 @@ static uint32_t g_txLastOkMs = 0;
 static uint32_t g_txLastSendMs = 0;
 static uint32_t g_txFailStreak = 0;
 
+#if defined(ROLE_TX)
+static uint8_t g_peer[6] = {0};   // filled from PEER* defines
+#endif
+
 // ----------------- CRC16-CCITT -----------------
 static uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc = 0xFFFF) {
   for (size_t i = 0; i < len; ++i) {
@@ -139,7 +138,11 @@ static uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc = 0xFF
 
 // ----------------- Wi-Fi helpers -----------------
 static void lock_wifi_channel(uint8_t ch) {
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);     // drop any AP state
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
   esp_wifi_set_promiscuous(false);
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
 }
@@ -150,16 +153,16 @@ static void print_mac(const uint8_t mac[6], const char* label) {
 
 // ----------------- ESP-NOW callbacks -----------------
 #if defined(ROLE_RX)
-static void on_recv_cb(const uint8_t* mac, const uint8_t* data, int len) {
+static void on_recv_cb(const uint8_t* /*mac*/, const uint8_t* data, int len) {
   if (len < (int)(sizeof(RadioHdr) + 2)) return;
 
   const RadioHdr* hdr = (const RadioHdr*)data;
   const uint8_t* payload = data + sizeof(RadioHdr);
   const int plen = hdr->len;
 
-  if (plen < 0 || (int)sizeof(RadioHdr) + plen + 2 != len) { g_pktsToolong++; return; }
-  if (plen > (int)MAX_PAYLOAD) { g_pktsToolong++; return; }
-  if (hdr->proto != PROTO_ID) { return; } // drop other-protocol packets
+  if ((int)sizeof(RadioHdr) + plen + 2 != len) { g_pktsToolong++; return; }
+  if (plen <= 0 || plen > (int)MAX_PAYLOAD)     { g_pktsToolong++; return; }
+  if (hdr->proto != PROTO_ID)                   { return; } // other protocol
 
   uint16_t expect; memcpy(&expect, data + sizeof(RadioHdr) + plen, 2);
   uint16_t calc = crc16_ccitt(data, sizeof(RadioHdr) + plen);
@@ -168,7 +171,6 @@ static void on_recv_cb(const uint8_t* mac, const uint8_t* data, int len) {
   if (hdr->seq <= g_lastSeq) { g_pktsDup++; return; }
   g_lastSeq = hdr->seq;
 
-  // Write GHST frame bytes straight to UART
   UartOut.write(payload, plen);
   g_pktsOk++;
   g_lastRxMs = millis();
@@ -181,7 +183,7 @@ static void on_recv_cb(const uint8_t* mac, const uint8_t* data, int len) {
 #endif
 
 #if defined(ROLE_TX)
-static void on_send_cb(const uint8_t*, esp_now_send_status_t status) {
+static void on_send_cb(const uint8_t* /*mac*/, esp_now_send_status_t status) {
   g_txLastSendMs = millis();
   if (status == ESP_NOW_SEND_SUCCESS) {
     g_txFailStreak = 0;
@@ -205,7 +207,7 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  Serial.begin(420000);
+  Serial.begin(115200);               // USB console only
   delay(100);
   Serial.println("\nESP-NOW Serial Tunnel (GHST-framed)");
 
@@ -232,7 +234,21 @@ void setup() {
     peer.peer_addr[3] = (uint8_t)PEER3;
     peer.peer_addr[4] = (uint8_t)PEER4;
     peer.peer_addr[5] = (uint8_t)PEER5;
-    if (esp_now_add_peer(&peer) != ESP_OK) Serial.println("esp_now_add_peer FAILED");
+
+    bool allZero = true;
+    for (int i = 0; i < 6; ++i) if (peer.peer_addr[i]) { allZero = false; break; }
+    if (allZero) {
+      Serial.println("** ERROR: PEER0..5 not set to RX MAC! **");
+    }
+
+    if (esp_now_add_peer(&peer) != ESP_OK) {
+      Serial.println("esp_now_add_peer FAILED");
+    } else {
+      memcpy(g_peer, peer.peer_addr, 6);
+      Serial.print("[Peer] ");
+      print_mac(g_peer, "TX->RX");
+    }
+
     esp_now_register_send_cb(on_send_cb);
     Serial.println("[ROLE] TX");
   }
@@ -258,7 +274,7 @@ void setup() {
                 "SBUS",
 #endif
                 PROTO_BAUD, (unsigned long)PROTO_CFG, (int)RX_INVERT, (int)TX_INVERT);
-  Serial.printf("[WiFi] Locked to channel %d\n", ESPNOW_CHANNEL);
+  Serial.printf("[WiFi] Locked to channel %d (PS off)\n", ESPNOW_CHANNEL);
   Serial.flush();
 }
 
@@ -266,44 +282,37 @@ void setup() {
 #if defined(ROLE_TX) && defined(PROTO_GHST)
 // GHST frame = 0x3B, TYPE, LEN, then LEN bytes (payload+CRC8) → total = 3 + LEN
 static const uint8_t GHST_SYNC = 0x3B;
-static const uint8_t GHST_MAX_LEN = 48;   // safe upper bound for LEN byte
+static const uint8_t GHST_MAX_LEN = 48;
 
 static bool ghst_get_frame(HardwareSerial& s, uint8_t* out, int& outLen) {
   static uint8_t buf[3 + GHST_MAX_LEN];
   static int have = 0;
-  // fill buffer with whatever's available (bounded)
+
   while (s.available() && have < (int)sizeof(buf)) {
     buf[have++] = (uint8_t)s.read();
   }
-
-  // need at least 3 to know length
   if (have < 3) { outLen = 0; return false; }
 
-  // find sync
   int start = -1;
-  for (int i = 0; i <= have - 1; ++i) { if (buf[i] == GHST_SYNC) { start = i; break; } }
+  for (int i = 0; i < have; ++i) { if (buf[i] == GHST_SYNC) { start = i; break; } }
   if (start < 0) { have = 0; outLen = 0; return false; }
   if (start > 0) { memmove(buf, buf + start, have - start); have -= start; }
-
   if (have < 3) { outLen = 0; return false; }
 
   uint8_t len = buf[2];
   if (len == 0 || len > GHST_MAX_LEN) {
-    // bad LEN, drop the sync and rescan next time
+    // drop sync and rescan
     memmove(buf, buf + 1, have - 1);
     have -= 1;
-    outLen = 0;
-    return false;
+    outLen = 0; return false;
   }
 
   int total = 3 + len;
-  if (have < total) { outLen = 0; return false; } // wait for full frame
+  if (have < total) { outLen = 0; return false; }
 
-  // We have a complete frame
   memcpy(out, buf, total);
   outLen = total;
 
-  // consume
   memmove(buf, buf + total, have - total);
   have -= total;
   return true;
@@ -316,7 +325,6 @@ void loop() {
   static uint32_t seq = 0;
   static uint8_t pkt[sizeof(RadioHdr) + MAX_PAYLOAD + 2];
 
-  // Pull and send complete GHST frames
   int ghLen = 0;
 #if defined(PROTO_GHST)
   static uint8_t ghstFrame[MAX_PAYLOAD];
@@ -335,14 +343,15 @@ void loop() {
     uint16_t crc = crc16_ccitt(pkt, sizeof(RadioHdr) + ghLen);
     memcpy(pkt + sizeof(RadioHdr) + ghLen, &crc, 2);
 
-    esp_now_send(nullptr, pkt, sizeof(RadioHdr) + ghLen + 2);
+    // ---- UNICAST send (more reliable than broadcast) ----
+    esp_now_send(g_peer, pkt, sizeof(RadioHdr) + ghLen + 2);
 #if DUP_SEND
-    esp_now_send(nullptr, pkt, sizeof(RadioHdr) + ghLen + 2);
+    esp_now_send(g_peer, pkt, sizeof(RadioHdr) + ghLen + 2);
 #endif
     digitalWrite(LED_PIN, !digitalRead(LED_PIN));
   }
 #else
-  // (If you ever flip to CRSF/SBUS tunneling again, you can put the old coalescer here)
+  // generic tunneling fallback (unused in GHST build)
   int avail = UartIn.available();
   if (avail > 0) {
     int toRead = min(avail, (int)MAX_PAYLOAD);
@@ -356,7 +365,7 @@ void loop() {
     int got = UartIn.readBytes(pkt + sizeof(RadioHdr), toRead);
     uint16_t crc = crc16_ccitt(pkt, sizeof(RadioHdr) + got);
     memcpy(pkt + sizeof(RadioHdr) + got, &crc, 2);
-    esp_now_send(nullptr, pkt, sizeof(RadioHdr) + got + 2);
+    esp_now_send(g_peer, pkt, sizeof(RadioHdr) + got + 2);
     digitalWrite(LED_PIN, !digitalRead(LED_PIN));
   }
 #endif
