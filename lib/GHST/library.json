@@ -1,0 +1,9 @@
+{
+  "name": "GHST",
+  "version": "1.0.0",
+  "description": "Ghost protocol handling",
+  "keywords": "ghst, protocol, rc",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": []
+}

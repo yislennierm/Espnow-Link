@@ -1,0 +1,13 @@
+{
+  "name": "link",
+  "version": "0.1.0",
+  "description": "Espnow link",
+  "keywords": ["link"],
+  "authors": [
+    {
+      "name": "Your Name",
+      "maintainer": true
+    }
+  ]
+  
+}
