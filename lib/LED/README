@@ -1,0 +1,8 @@
+STATUS[1] - LINK (ESPNOW link status)
+STATUS[2] - Input (handset inpur data to TX)
+STATUS[3] - Protocol (Protocol OK according to whats expected in the build flag)
+STATUS[4] - Telemetry (TBD)
+STATUS[5] - (TBD)
+STATUS[6] - (TBD)
+STATUS[7] - (TBD)
+STATUS[8] - (TBD)

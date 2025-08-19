@@ -1,10 +1,20 @@
 #pragma once
 #include <Arduino.h>
-#include <esp_now.h>
 
+void link_init();
+void link_loop();
+// link.h
 
-bool wifi_init(uint8_t channel);
-bool wifi_set_peer(const uint8_t* mac);
-bool wifi_send(const uint8_t* data, int len);
-void wifi_debug();
-void wifi_register_app_rx(esp_now_recv_cb_t cb);
+void link_set_recv_cb(void (*cb)(const uint8_t *, const uint8_t *, int));
+
+#ifdef ROLE_TX
+bool link_send(const uint8_t *data, size_t len);
+#endif
+// ==================
+// State Machine
+// ==================
+enum LinkState {
+    LINK_INIT = 0,
+    LINK_IDLE,
+    LINK_ERROR
+};

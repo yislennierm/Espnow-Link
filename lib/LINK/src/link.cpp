@@ -1,102 +1,155 @@
-#include <Arduino.h>
-#include <WiFi.h>
-#include <esp_wifi.h>
-#include <esp_now.h>
-
 #include "link.h"
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include "status.h"
 
-// ----------------- internal state -----------------
-static bool g_linkUp = false;
-static uint32_t g_lastOkMs = 0;
-static uint32_t g_lastSendMs = 0;
-static uint32_t g_failStreak = 0;
-static uint8_t g_peer[6] = {0};
+// ==================
+// Globals
+// ==================
+static QueueHandle_t txQueue = nullptr;
+static QueueHandle_t rxQueue = nullptr;
 
-// ----------------- helpers -----------------
-static void print_mac(const uint8_t mac[6], const char* label) {
-    Serial.printf("%s %02X:%02X:%02X:%02X:%02X:%02X\n", label,
-                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
+static LinkState currentState = LINK_INIT;
 
-// ----------------- send callback -----------------
-static void on_send_cb(const uint8_t* /*mac*/, esp_now_send_status_t status) {
-    g_lastSendMs = millis();
+struct FrameItem {
+    uint8_t data[250];
+    size_t len;
+};
+
+#ifdef ROLE_TX
+static uint8_t peerMac[6] = {
+    (uint8_t)PEER0, (uint8_t)PEER1, (uint8_t)PEER2,
+    (uint8_t)PEER3, (uint8_t)PEER4, (uint8_t)PEER5
+};
+static esp_now_peer_info_t peerInfo;
+static volatile bool sendFailed = false;   // <-- safe flag for TX errors
+#endif
+
+// ==================
+// Callbacks
+// ==================
+#ifdef ROLE_TX
+static void on_sent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     if (status == ESP_NOW_SEND_SUCCESS) {
-        g_failStreak = 0;
-        if (!g_linkUp) {
-            g_linkUp = true;
-            Serial.println("[WIFI] LINK UP");
-        }
-        g_lastOkMs = g_lastSendMs;
+        Serial.println("[LINK] Send OK");
     } else {
-        g_failStreak++;
-        if (g_linkUp && g_failStreak >= 5) { // configurable if needed
-            g_linkUp = false;
-            Serial.println("[WIFI] LINK DOWN (consecutive send fails)");
-        }
+        Serial.println("[LINK] Send FAIL");
+        sendFailed = true;  // don’t touch semaphores here
     }
 }
+#endif
 
-// ----------------- public API -----------------
-bool wifi_init(uint8_t channel) {
-    WiFi.persistent(false);
+#ifdef ROLE_RX
+static void on_recv(const uint8_t *mac_addr, const uint8_t *data, int len) {
+    FrameItem item;
+    if (len > sizeof(item.data)) return;
+    memcpy(item.data, data, len);
+    item.len = len;
+    if (rxQueue) xQueueSend(rxQueue, &item, 0);
+    status_set_bits(STATUS_INPUT);
+}
+#endif
+
+// ==================
+// Init
+// ==================
+void link_init() {
     WiFi.mode(WIFI_STA);
-    WiFi.disconnect(true, true);
-    WiFi.setSleep(false);
+    vTaskDelay(pdMS_TO_TICKS(500));  // safer delay for WiFi stack
 
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    esp_wifi_set_promiscuous(false);
-    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-
-    uint8_t self[6];
-    esp_wifi_get_mac(WIFI_IF_STA, self);
-    print_mac(self, "[Self MAC]");
+#ifdef ESPNOW_CHANNEL
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    vTaskDelay(pdMS_TO_TICKS(300));
+#endif
 
     if (esp_now_init() != ESP_OK) {
-        Serial.println("esp_now_init FAILED");
-        return false;
+        Serial.println("[LINK] esp_now_init failed");
+        status_clear_bits(STATUS_LINK);
+        currentState = LINK_ERROR;
+        return;
     }
 
-    esp_now_register_send_cb(on_send_cb);
-    Serial.printf("[WIFI] ESPNOW init OK (channel %d)\n", channel);
-    return true;
-}
-
-bool wifi_set_peer(const uint8_t* mac) {
-    if (!mac) return false;
-
-    esp_now_peer_info_t peer{};
-    memcpy(peer.peer_addr, mac, 6);
-    peer.channel = 0;     // use current channel
-    peer.encrypt = false;
-    peer.ifidx = WIFI_IF_STA;
-
-    if (esp_now_add_peer(&peer) != ESP_OK) {
-        Serial.println("esp_now_add_peer FAILED");
-        return false;
+#ifdef ROLE_TX
+    esp_now_register_send_cb(on_sent);
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    memcpy(peerInfo.peer_addr, peerMac, 6);
+    peerInfo.channel = ESPNOW_CHANNEL;
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("[LINK] Failed to add peer");
+        status_clear_bits(STATUS_LINK);
+        currentState = LINK_ERROR;
+        return;
     }
-    memcpy(g_peer, mac, 6);
-    print_mac(g_peer, "[Peer]");
-    return true;
+#endif
+
+#ifdef ROLE_RX
+    esp_now_register_recv_cb(on_recv);
+#endif
+
+    txQueue = xQueueCreate(10, sizeof(FrameItem));
+    rxQueue = xQueueCreate(10, sizeof(FrameItem));
+
+    status_set_bits(STATUS_LINK);
+    currentState = LINK_IDLE;
 }
 
-bool wifi_send(const uint8_t* data, int len) {
-    if (!g_peer[0] && !g_peer[1] && !g_peer[2] &&
-        !g_peer[3] && !g_peer[4] && !g_peer[5]) {
-        Serial.println("[WIFI] ERROR: No peer set!");
-        return false;
+// ==================
+// Send
+// ==================
+#ifdef ROLE_TX
+bool link_send(const uint8_t *data, size_t len) {
+    if (!txQueue) return false;
+    FrameItem item;
+    if (len > sizeof(item.data)) return false;
+    memcpy(item.data, data, len);
+    item.len = len;
+    return xQueueSend(txQueue, &item, 0) == pdTRUE;
+}
+#endif
+
+// ==================
+// Loop
+// ==================
+void link_loop() {
+    switch (currentState) {
+    case LINK_IDLE:
+#ifdef ROLE_TX
+        if (sendFailed) {   // process errors safely in app context
+            status_clear_bits(STATUS_LINK);
+            currentState = LINK_ERROR;
+            sendFailed = false;
+        }
+
+        if (txQueue) {
+            FrameItem item;
+            if (xQueueReceive(txQueue, &item, 0) == pdTRUE) {
+                esp_err_t res = esp_now_send(peerMac, item.data, item.len);
+                if (res != ESP_OK) {
+                    Serial.printf("[LINK] esp_now_send error=%d\n", res);
+                    status_clear_bits(STATUS_LINK);
+                    currentState = LINK_ERROR;
+                }
+            }
+        }
+#endif
+
+#ifdef ROLE_RX
+        if (rxQueue) {
+            FrameItem item;
+            if (xQueueReceive(rxQueue, &item, 0) == pdTRUE) {
+                Serial1.write(item.data, item.len);
+            }
+        }
+#endif
+        break;
+
+    case LINK_ERROR:
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        break;
+
+    default:
+        break;
     }
-    return (esp_now_send(g_peer, data, len) == ESP_OK);
-}
-
-void wifi_debug() {
-    uint32_t now = millis();
-    Serial.printf("[WIFI] lastOk=%lu ms ago  failStreak=%lu  link=%s\n",
-                  (unsigned long)(now - g_lastOkMs),
-                  (unsigned long)g_failStreak,
-                  g_linkUp ? "YES" : "NO");
-}
-
-void wifi_register_app_rx(esp_now_recv_cb_t cb) {
-    esp_now_register_recv_cb(cb);
 }

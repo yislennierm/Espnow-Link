@@ -1,93 +1,108 @@
+#include <Arduino.h>
 #include "ghst.h"
-
-namespace {
-  // Small static buffer for frame assembly in get_frame()
-  uint8_t s_buf[3 + ghst::MAX_LEN];
-  int     s_have = 0;
-}
 
 namespace ghst {
 
-bool get_frame(HardwareSerial& s, uint8_t* out, int& outLen)
-{
-  // Slurp bytes (bounded)
-  while (s.available() && s_have < (int)sizeof(s_buf)) {
-    s_buf[s_have++] = (uint8_t)s.read();
-  }
+static HardwareSerial *ghstSerial = nullptr;
+static uint16_t channels[16] = {2048};
+static unsigned long lastDebug = 0;
 
-  // Need at least sync/type/len
-  if (s_have < 3) { outLen = 0; return false; }
+// Frame IDs
+constexpr uint8_t GHST_ADDR_TX = 0x80;
+constexpr uint8_t GHST_FRAME_TYPE_CHANNEL  = 0x3B;
+constexpr uint8_t GHST_FRAME_TYPE_CHANNEL16 = 0x3C;
 
-  // Find sync
-  int start = -1;
-  for (int i = 0; i < s_have; ++i) {
-    if (s_buf[i] == SYNC) { start = i; break; }
-  }
-  if (start < 0) { s_have = 0; outLen = 0; return false; }
 
-  // Align to sync
-  if (start > 0) {
-    memmove(s_buf, s_buf + start, s_have - start);
-    s_have -= start;
-  }
-  if (s_have < 3) { outLen = 0; return false; }
-
-  // Length byte is at index 2
-  uint8_t len = s_buf[2];
-  if (len == 0 || len > MAX_LEN) {
-    // bad LEN → drop this sync byte and rescan next loop
-    memmove(s_buf, s_buf + 1, s_have - 1);
-    s_have -= 1;
-    outLen = 0;
-    return false;
-  }
-
-  const int total = 3 + len;
-  if (s_have < total) { outLen = 0; return false; }
-
-  // Full frame ready
-  memcpy(out, s_buf, total);
-  outLen = total;
-
-  // Consume from the ring
-  memmove(s_buf, s_buf + total, s_have - total);
-  s_have -= total;
-  return true;
+// Very simple check: GHST frames have a length byte at index 1
+bool isCompleteFrame(const uint8_t *buf, int len) {
+    if (len < 2) return false;         // too short to contain header
+    uint8_t frameLen = buf[1] + 2;     // length byte + header + CRC
+    return (len >= frameLen);
 }
 
-// Quick visual decoder for 8 channels (matches EdgeTX packing we observed)
-void debug_decode_channels(const uint8_t* frame, size_t len)
-{
-  if (len < 15) return; // addr + len + type + payload + crc
+void init(HardwareSerial &serial) {
+    ghstSerial = &serial;
+    serial.begin(BAUD, CFG);
+}
 
-  const uint8_t* payload = frame + 3; // skip addr,len,type
-  int ch[8];
-
-  // 4x 12-bit packed (LSB-first)
-  uint32_t bits = 0;
-  uint8_t  avail = 0;
-  int      outi = 0;
-
-  for (int i = 0; i < 4; i++) {
-    while (avail < 12) {
-      bits |= ((uint32_t)(*payload++)) << avail;
-      avail += 8;
+static int buildChannelsFrame8(uint8_t *buf, int maxlen) {
+    if (maxlen < 14) return 0;
+    buf[0] = GHST_ADDR_TX;
+    buf[1] = 12;
+    buf[2] = GHST_FRAME_TYPE_CHANNEL;
+    for (int i=0; i<8; i++) {
+        uint16_t val = channels[i] & 0x0FFF;
+        buf[3 + i*2] = val & 0xFF;
+        buf[4 + i*2] = (val >> 8) & 0xFF;
     }
-    ch[outi++] = bits & 0x0FFF; // 0..4095
-    bits   >>= 12;
-    avail  -= 12;
-  }
+    return 3 + 16;
+}
 
-  // 4x 8-bit
-  for (int i = 4; i < 8; i++) ch[i] = *payload++;
 
-  // Pretty print (center first 4 to ±2048; scale last 4 to approximate ±1024)
-  Serial.print("[GHST] ");
-  for (int i = 0; i < 8; i++) {
-    int val = (i < 4) ? (ch[i] - 2048) : ((ch[i] - 128) * 8);
-    Serial.printf("CH%02d=%5d  ", i + 1, val);
-  }
-  Serial.println();
+
+
+
+
+static int buildChannelsFrame16(uint8_t *buf, int maxlen) {
+    if (maxlen < 30) return 0;
+    buf[0] = GHST_ADDR_TX;
+    buf[1] = 28;
+    buf[2] = GHST_FRAME_TYPE_CHANNEL16;
+    for (int i=0; i<16; i++) {
+        uint16_t val = channels[i] & 0x0FFF;
+        buf[3 + i*2] = val & 0xFF;
+        buf[4 + i*2] = (val >> 8) & 0xFF;
+    }
+    return 3 + 32;
+}
+
+int buildChannelsFrame(uint8_t *buf, int maxLen, int numCh) {
+    if (numCh <= 8) return buildChannelsFrame8(buf, maxLen);
+    else return buildChannelsFrame16(buf, maxLen);
+}
+
+void setChannel(int idx, uint16_t value) {
+    if (idx < 0 || idx >= 16) return;
+    channels[idx] = value;
+}
+
+
+void debug_decode_channels(const uint8_t *frame) {
+    if (!frame) return;
+
+    uint16_t channels[16] = {0};
+    int bitIndex = 0;
+
+    for (int ch = 0; ch < 16; ch++) {
+        int byteIndex = 1 + (bitIndex >> 3);
+        int shift     = bitIndex & 7;
+
+        uint32_t word = (uint32_t)frame[byteIndex] |
+                        ((uint32_t)frame[byteIndex + 1] << 8) |
+                        ((uint32_t)frame[byteIndex + 2] << 16);
+
+        channels[ch] = (word >> shift) & 0x0FFF;
+        bitIndex += 12;
+    }
+
+    Serial.print("[GHST RX] ");
+    for (int i = 0; i < 16; i++) {
+        Serial.printf("CH%d=%d ", i+1, channels[i]);
+    }
+    Serial.println();
+}
+
+
+void debugTxChannels(int numCh) {
+    unsigned long now = millis();
+    if (now - lastDebug < 200) return;
+    lastDebug = now;
+
+    Serial.print("[GHST] TX ");
+    for (int i=0; i<numCh; i++) {
+        Serial.printf("CH%d=%d ", i+1, channels[i]);
+    }
+    Serial.println();
 }
 
 } // namespace ghst
