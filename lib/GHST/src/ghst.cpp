@@ -65,32 +65,38 @@ void setChannel(int idx, uint16_t value) {
     if (idx < 0 || idx >= 16) return;
     channels[idx] = value;
 }
-
-
-void debug_decode_channels(const uint8_t *frame) {
+void debug_dump_frame(const uint8_t *frame, int len) {
     if (!frame) return;
-
-    uint16_t channels[16] = {0};
-    int bitIndex = 0;
-
-    for (int ch = 0; ch < 16; ch++) {
-        int byteIndex = 1 + (bitIndex >> 3);
-        int shift     = bitIndex & 7;
-
-        uint32_t word = (uint32_t)frame[byteIndex] |
-                        ((uint32_t)frame[byteIndex + 1] << 8) |
-                        ((uint32_t)frame[byteIndex + 2] << 16);
-
-        channels[ch] = (word >> shift) & 0x0FFF;
-        bitIndex += 12;
-    }
-
-    Serial.print("[GHST RX] ");
-    for (int i = 0; i < 16; i++) {
-        Serial.printf("CH%d=%d ", i+1, channels[i]);
+    Serial.printf("[GHST RAW] len=%d: ", len);
+    for (int i = 0; i < len; i++) {
+        Serial.printf("%02X ", frame[i]);
     }
     Serial.println();
 }
+
+void debug_decode_channels(const uint8_t *frame, int len) {
+    if (len < 2) return;
+    uint8_t type = frame[2];   // frame ID
+    const uint8_t *payload = frame + 3;
+    
+    if (type == GHST_UL_RC_CHANS_HS4_12_5TO8 || type == GHST_UL_RC_CHANS_HS4_5TO8) {
+        // decode first 4x12bit packed
+        uint32_t bits = payload[0] | (payload[1] << 8) | (payload[2] << 16) | (payload[3] << 24);
+        for (int i=0; i<4; i++) {
+            int ch = bits & 0xFFF;
+            bits >>= 12;
+            Serial.printf("CH%d=%d ", i+1, ch);
+        }
+        // then decode next 4x8bit
+        for (int i=0; i<4; i++) {
+            Serial.printf("CH%d=%d ", i+5, payload[4+i]);
+        }
+        Serial.println();
+    }
+}
+
+
+
 
 
 void debugTxChannels(int numCh) {
