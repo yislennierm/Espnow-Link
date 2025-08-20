@@ -33,26 +33,6 @@ extern SemaphoreHandle_t status_lock;
 
 void status_init(uint8_t ledPin);
 
-// Thread-safe accessors
-inline void status_set_bits(uint32_t bits) {
-    if (xSemaphoreTake(status_lock, portMAX_DELAY)) {
-        STATUS_REG |= bits;
-        xSemaphoreGive(status_lock);
-    }
-}
-
-inline void status_clear_bits(uint32_t bits) {
-    if (xSemaphoreTake(status_lock, portMAX_DELAY)) {
-        STATUS_REG &= ~bits;
-        xSemaphoreGive(status_lock);
-    }
-}
-
-inline uint32_t status_get() {
-    uint32_t value = 0;
-    if (xSemaphoreTake(status_lock, portMAX_DELAY)) {
-        value = STATUS_REG;
-        xSemaphoreGive(status_lock);
-    }
-    return value;
-}
+void status_set(uint32_t bits);
+void status_clear(uint32_t bits);
+uint32_t status_check();

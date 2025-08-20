@@ -3,6 +3,8 @@
 #include "ghst.h"
 #include "status.h"
 #include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -58,6 +60,7 @@ void fcForwarderTask(void *pv) {
   for (;;) {
     if (xQueueReceive(rxQueue, &frame, portMAX_DELAY)) {
       Serial1.write(frame, frame[1] + 2);   // forward to FC
+     
       ghst::debug_decode_channels(frame);   // debug
       free(frame);
     }
@@ -70,12 +73,24 @@ void setup() {
   
   
   Serial.begin(115200);
-  vTaskDelay(pdMS_TO_TICKS(20));
+  vTaskDelay(pdMS_TO_TICKS(3000));
+
+
+    WiFi.mode(WIFI_STA);
+    vTaskDelay(pdMS_TO_TICKS(3000));
+#ifdef ESPNOW_CHANNEL
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+#endif
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[LINK] esp_now_init failed");
+        return;
+    }
 
   
   status_init(LED_PIN);
-  vTaskDelay(pdMS_TO_TICKS(20));
-  Serial.println("Status Task - Started");
+  vTaskDelay(pdMS_TO_TICKS(500));
+ 
   
   link_init();
   vTaskDelay(pdMS_TO_TICKS(100));
