@@ -47,7 +47,7 @@ void espnowSenderTask(void *pv) {
 void setup() {
   common_setup();
 
-  Serial2.begin(ghst::BAUD, ghst::CFG, RX_PIN, TX_PIN, ghst::TX_INVERT);
+  Serial1.begin(ghst::BAUD, ghst::CFG, RX_PIN, TX_PIN, ghst::TX_INVERT);
   txQueue = xQueueCreate(10, sizeof(uint8_t*));
 
   xTaskCreate(uartReaderTask, "uartReader", 4096, NULL, 1, NULL);
